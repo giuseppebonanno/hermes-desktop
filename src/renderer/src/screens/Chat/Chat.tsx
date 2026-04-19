@@ -1,10 +1,9 @@
 import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import icon from "../../assets/icon.png";
 import { AgentMarkdown } from "../../components/AgentMarkdown";
+import { MarkdownInput } from "../../components/MarkdownInput";
 import {
   Trash2 as Trash,
-  Send,
-  Square as Stop,
   Plus,
   ChevronDown,
   Search,
@@ -16,6 +15,10 @@ import {
   Slash,
   Zap,
 } from "lucide-react";
+
+type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: string } };
 
 // ── Slash Commands ──────────────────────────────────────
 
@@ -111,11 +114,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   },
   { name: "/tools", description: "List available tools", category: "info" },
   { name: "/skills", description: "List installed skills", category: "info" },
-  {
-    name: "/model",
-    description: "Show or switch the current model",
-    category: "info",
-  },
+  { name: "/model", description: "Show or switch the current model", category: "info" },
   { name: "/memory", description: "Show agent memory", category: "info" },
   { name: "/persona", description: "Show current persona", category: "info" },
   { name: "/version", description: "Show Hermes version", category: "info" },
@@ -157,11 +156,7 @@ const MessageRow = memo(function MessageRow({
         <HermesAvatar />
       )}
       <div className={`chat-bubble chat-bubble-${msg.role}`}>
-        {msg.role === "agent" ? (
-          <AgentMarkdown>{msg.content}</AgentMarkdown>
-        ) : (
-          msg.content
-        )}
+        <AgentMarkdown>{msg.content}</AgentMarkdown>
       </div>
       {msg.role === "agent" &&
         !isLoading &&
@@ -187,6 +182,17 @@ export interface ChatMessage {
   id: string;
   role: "user" | "agent";
   content: string;
+  attachments?: Attachment[];
+}
+
+interface Attachment {
+  id: string;
+  name: string;
+  type: string;
+  preview?: string;
+  data?: string;
+  isLarge: boolean;
+  isSupported: boolean;
 }
 
 interface ModelGroup {
@@ -245,6 +251,9 @@ function Chat({
   const [slashFilter, setSlashFilter] = useState("");
   const [slashSelectedIndex, setSlashSelectedIndex] = useState(0);
   const slashMenuRef = useRef<HTMLDivElement>(null);
+
+  // Attachments state
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
 
   // Keep ref in sync for use in IPC callbacks
   isLoadingRef.current = isLoading;
@@ -486,10 +495,13 @@ function Chat({
 
   async function handleSend(): Promise<void> {
     const text = input.trim();
-    if (!text || isLoading) return;
+    const hasAttachments = attachments.length > 0;
+    if ((!text && !hasAttachments) || isLoading) return;
 
     setSlashMenuOpen(false);
     setInput("");
+    const currentAttachments = [...attachments];
+    setAttachments([]);
 
     if (inputRef.current) {
       inputRef.current.style.height = "auto";
@@ -505,7 +517,12 @@ function Chat({
         if (cmd !== "/new" && cmd !== "/clear") {
           setMessages((prev) => [
             ...prev,
-            { id: `user-${Date.now()}`, role: "user", content: text },
+            {
+              id: `user-${Date.now()}`,
+              role: "user",
+              content: text,
+              attachments: currentAttachments,
+            },
           ]);
         }
         await executeLocalCommand(text);
@@ -516,13 +533,39 @@ function Chat({
     setIsLoading(true);
     setMessages((prev) => [
       ...prev,
-      { id: `user-${Date.now()}`, role: "user", content: text },
+      {
+        id: `user-${Date.now()}`,
+        role: "user",
+        content: text,
+        attachments: currentAttachments,
+      },
     ]);
     onSessionStarted?.();
 
     try {
+      // Build content: text + image attachments
+      let content: string | ContentPart[] = text;
+      if (currentAttachments.length > 0) {
+        const contentParts: ContentPart[] = [];
+        if (text) {
+          contentParts.push({ type: "text", text });
+        }
+        // Add supported image attachments
+        for (const att of currentAttachments) {
+          if (att.isSupported && att.type.startsWith("image/") && att.data) {
+            contentParts.push({
+              type: "image_url",
+              image_url: { url: att.data },
+            });
+          }
+        }
+        if (contentParts.length > 0) {
+          content = contentParts;
+        }
+      }
+
       await window.hermesAPI.sendMessage(
-        text,
+        content,
         profile,
         hermesSessionId || undefined,
         messages.map((m) => ({ role: m.role, content: m.content })),
@@ -590,16 +633,20 @@ function Chat({
     }
   }
 
-  function handleInputChange(e: React.ChangeEvent<HTMLTextAreaElement>): void {
-    const value = e.target.value;
+  function handleInputChange(
+    e: React.ChangeEvent<HTMLTextAreaElement> | string,
+  ): void {
+    const value = typeof e === "string" ? e : e.target.value;
     setInput(value);
 
     // Defer reflow-triggering resize to next frame
-    const target = e.target;
-    requestAnimationFrame(() => {
-      target.style.height = "auto";
-      target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
-    });
+    if (typeof e !== "string" && e.target) {
+      const target = e.target;
+      requestAnimationFrame(() => {
+        target.style.height = "auto";
+        target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
+      });
+    }
 
     // Slash command detection: open menu when input starts with /
     if (value.startsWith("/") && !value.includes(" ")) {
@@ -1069,48 +1116,18 @@ function Chat({
             </div>
           </div>
         )}
-        <div className="chat-input-wrapper">
-          <textarea
-            ref={inputRef}
-            className="chat-input"
-            placeholder="Type a message... (Shift+Enter for new line)"
-            value={input}
-            onChange={handleInputChange}
-            onKeyDown={handleKeyDown}
-            rows={1}
-            disabled={isLoading}
-            autoFocus
-          />
-          {isLoading ? (
-            <button
-              className="chat-send-btn chat-stop-btn"
-              onClick={handleAbort}
-              title="Stop"
-            >
-              <Stop size={14} />
-            </button>
-          ) : (
-            <>
-              {input.trim() && hermesSessionId && (
-                <button
-                  className="chat-btw-btn"
-                  onClick={handleQuickAsk}
-                  title="Quick Ask (/btw) — side question that won't affect conversation context"
-                >
-                  💭
-                </button>
-              )}
-              <button
-                className="chat-send-btn"
-                onClick={handleSend}
-                disabled={!input.trim()}
-                title="Send"
-              >
-                <Send size={16} />
-              </button>
-            </>
-          )}
-        </div>
+        <MarkdownInput
+          value={input}
+          onChange={handleInputChange}
+          onKeyDown={handleKeyDown}
+          onSend={handleSend}
+          onStop={handleAbort}
+          isLoading={isLoading}
+          disabled={isLoading}
+          placeholder="Type a message... (Shift+Enter for new line)"
+          showBtw={!!input.trim() && !!hermesSessionId}
+          onQuickAsk={handleQuickAsk}
+        />
 
         <div className="chat-model-bar" ref={pickerRef}>
           <button
